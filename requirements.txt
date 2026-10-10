@@ -1,0 +1,4 @@
+playwright>=1.47
+pandas>=2.2
+supabase>=2.6
+pytest>=8

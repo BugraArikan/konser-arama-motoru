@@ -1,0 +1,44 @@
+name: Günlük konser ETL
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # her gün 03:00 UTC = 06:00 İstanbul
+  workflow_dispatch: {}    # Actions sekmesinden elle çalıştırma
+
+concurrency:
+  group: konser-etl
+  cancel-in-progress: false
+
+jobs:
+  etl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Bağımlılıklar
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Testler
+        run: pytest -q
+
+      - name: ETL
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python pipeline.py
+
+      - name: Ham ve temiz CSV'leri sakla
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: konser-verisi-${{ github.run_id }}
+          path: data/*.csv
+          retention-days: 14
