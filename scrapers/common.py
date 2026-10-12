@@ -175,6 +175,22 @@ def fill_prices_from_pages(events: list[RawEvent], workers: int = 8, limit: int 
     return filled
 
 
+# Cloudflare vb. bot doğrulama sayfalarının işaretleri.
+CHALLENGE_MARKERS = (
+    "just a moment", "bir dakika lütfen", "cf-chl", "challenge-platform", "cf_chl_opt",
+    "attention required", "checking your browser", "verify you are human",
+)
+
+
+class BotChallenge(Exception):
+    """Site otomatik erişimi bir doğrulama sayfasıyla durdurdu."""
+
+
+def is_bot_challenge(html_or_title: str) -> bool:
+    low = (html_or_title or "")[:20_000].lower()
+    return any(m in low for m in CHALLENGE_MARKERS)
+
+
 DEBUG_DIR = Path(os.environ.get("SCRAPE_DEBUG_DIR", "data/debug"))
 
 

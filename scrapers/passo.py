@@ -5,20 +5,29 @@ kodlamıyoruz. Sayfayı açıp kaydırırken API'den dönen JSON yanıtlarını
 dinliyor, içinde etkinliğe benzeyen nesneleri (isim + tarih alanı) topluyoruz.
 API'den hiçbir şey gelmezse DOM'daki /etkinlik/ linklerine düşüyoruz.
 
-Fiyat üç kademede aranır:
-1. Liste JSON'undaki fiyat alanları (anahtarında price/fiyat geçen sayılar).
-2. Bulunamazsa etkinlik detay API'si: /api/passoweb/geteventdetails/{seo}/{id}/118
-3. O da boşsa etkinlik sayfası tarayıcıda açılıp DOM'daki "₺" metni okunur.
+Fiyat dört kademede aranır, ilk bulunan kullanılır:
+1. Liste JSON'undaki fiyat alanları.
+2. Etkinlik detay API'si (/api/passoweb/geteventdetails/{seo}/{id}/118), tarayıcı
+   oturumunun çerezleriyle.
+3. Etkinlik sayfası tarayıcıda açılır; sayfanın yüklediği TÜM Passo JSON yanıtları
+   (kategori/koltuk/fiyat servisleri dahil) taranır.
+4. Hâlâ yoksa sayfa metnindeki "₺/TL" okunur, gerekirse "Bilet Al"a tıklanıp tekrar bakılır.
+
+"Fiyat alanı" geniş tutuldu: anahtarında price, fiyat, amount, tutar, ücret, bedel, cost
+geçen; değeri sayı ya da "1.250,00 TL" gibi metin olan her alan. İlk birkaç ham JSON
+yanıtı data/debug/passo/ altına yazılır ki alan isimleri değişirse görülebilsin.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import re
 
 from .common import (
-    RawEvent, accept_cookies, best_price_text, browser_page, click_load_more, dump_debug,
-    http_get, map_concurrent, scroll_to_bottom,
+    DEBUG_DIR, MIN_TICKET_PRICE, USER_AGENT, RawEvent, accept_cookies, best_price_text,
+    browser_page, click_load_more, dump_debug, price_value, scroll_to_bottom,
 )
 
 log = logging.getLogger("scraper.passo")
@@ -33,10 +42,19 @@ VENUE_KEYS = ("venueName", "venue", "placeName", "locationName")
 CITY_KEYS = ("cityName", "city")
 DETAIL_API = "https://" + API_HOST + "/api/passoweb/geteventdetails/{seo}/{id}/118"
 API_HEADERS = {"Accept": "application/json", "Origin": BASE, "Referer": BASE + "/"}
-MAX_RENDERED_PRICE_PAGES = 150
-PRICE_KEY_RE = re.compile(r"price|fiyat|amount|tutar", re.I)
-# İndirim, hizmet bedeli vb. bilet fiyatı değildir; en düşüğü seçerken araya karışmasın.
-NOT_PRICE_KEY_RE = re.compile(r"discount|fee|commission|tax|vat|indirim|komisyon|hizmet|count|id$|type|currency", re.I)
+PASSO_HOST_RE = re.compile(r"https://[^/]*passo\.com\.tr/")
+# Tarayıcıda açılacak en fazla etkinlik sayfası ve aynı anda açık sekme sayısı.
+MAX_RENDERED_PRICE_PAGES = 400
+PAGE_CONCURRENCY = 4
+DEBUG_SAMPLES = 3
+PRICE_KEY_RE = re.compile(r"price|fiyat|amount|tutar|[uü]cret|bedel|cost|fare|tarife", re.I)
+# İndirim, hizmet bedeli, tarih, sayaç vb. bilet fiyatı değildir; en düşüğü seçerken araya karışmasın.
+NOT_PRICE_KEY_RE = re.compile(
+    r"(?i:discount|fee|commission|tax|vat|indirim|komisyon|hizmet|count|id$|type|currency|"
+    r"date|time|tarih|code|kod|status|name|visible|show)|^(is|has)[A-Z_]",
+)
+PRICE_TEXT_LOCATOR = "text=/\\d[\\d.]*(,\\d{2})?\\s*(₺|TL)/"
+BUY_BUTTONS = ("Bilet Al", "Satın Al", "Hemen Al", "Biletler")
 ID_KEYS = ("id", "eventId")
 SEO_KEYS = ("seoUrl", "seoName", "url")
 
@@ -67,29 +85,40 @@ def find_events(obj) -> list[dict]:
 
 
 def _num(v) -> float | None:
-    if isinstance(v, bool):
+    if isinstance(v, bool) or v is None:
         return None
     if isinstance(v, (int, float)):
         return float(v)
-    if isinstance(v, str) and re.fullmatch(r"\s*\d+(?:[.,]\d+)?\s*", v):
-        return float(v.replace(",", "."))
+    if isinstance(v, str) and re.search(r"\d", v) and len(v) <= 40:
+        return price_value(v)   # "1.250,00 TL", "₺900", "500 - 1500 TL" -> ilk sayı
     return None
 
 
 def find_prices(obj, key: str = "") -> list[float]:
-    """JSON ağacındaki tüm bilet fiyatı adaylarını toplar (minPrice, prices[].price, ...)."""
+    """JSON ağacındaki tüm bilet fiyatı adaylarını toplar.
+
+    Fiyat anahtarının altındaki iç içe yapıları da kapsar: {"price": {"amount": 900}},
+    {"prices": [{"value": 900}]} gibi.
+    """
     out: list[float] = []
+    in_price = bool(key) and PRICE_KEY_RE.search(key) and not NOT_PRICE_KEY_RE.search(key)
     if isinstance(obj, dict):
         for k, v in obj.items():
             if isinstance(v, (dict, list)):
-                out.extend(find_prices(v, k))
-            elif PRICE_KEY_RE.search(k) and not NOT_PRICE_KEY_RE.search(k):
+                out.extend(find_prices(v, k if not in_price or PRICE_KEY_RE.search(k) else key))
+            elif (PRICE_KEY_RE.search(k) or (in_price and k in ("value", "min", "amount"))) \
+                    and not NOT_PRICE_KEY_RE.search(k):
                 n = _num(v)
-                if n and n > 0:
+                if n is not None and n >= MIN_TICKET_PRICE:
                     out.append(n)
     elif isinstance(obj, list):
         for v in obj:
-            out.extend(find_prices(v, key))
+            if in_price and not isinstance(v, (dict, list)):
+                n = _num(v)
+                if n is not None and n >= MIN_TICKET_PRICE:
+                    out.append(n)
+            else:
+                out.extend(find_prices(v, key))
     return out
 
 
@@ -172,45 +201,144 @@ def _seo_and_id(link: str) -> tuple[str, str]:
     return (m.group(1), m.group(2)) if m else ("", "")
 
 
-def detail_price(e: RawEvent) -> str:
+def _save_sample(name: str, url: str, payload) -> None:
+    try:
+        d = DEBUG_DIR / "passo"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{name}.json").write_text(json.dumps({"url": url, "body": payload}, ensure_ascii=False, indent=1)[:500_000],
+                                        encoding="utf-8")
+    except Exception as exc:
+        log.debug("örnek yazılamadı: %s", exc)
+
+
+def detail_price(e: RawEvent, get_json) -> str:
+    """get_json(url) -> dict | None. Tarayıcı oturumundan çağrılır (çerez/başlıklar sitedeki gibi)."""
     seo, eid = _seo_and_id(e.link)
     if not eid:
         return ""
-    body = http_get(DETAIL_API.format(seo=seo, id=eid), headers=API_HEADERS)
-    if not body:
+    url = DETAIL_API.format(seo=seo, id=eid)
+    body = get_json(url)
+    if not isinstance(body, dict):
         return ""
+    return min_price(body.get("value", body))
+
+
+async def _event_page_price(context, e: RawEvent, sample: bool) -> str:
+    payloads: list[tuple[str, object]] = []
+
+    async def on_response(resp):
+        if not PASSO_HOST_RE.match(resp.url) or "json" not in resp.headers.get("content-type", ""):
+            return
+        try:
+            payloads.append((resp.url, await resp.json()))
+        except Exception:
+            pass
+
+    page = await context.new_page()
+    page.on("response", on_response)
     try:
-        return min_price(json.loads(body).get("value") or {})
-    except (ValueError, AttributeError):
+        await page.goto(e.link, wait_until="domcontentloaded", timeout=30_000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=12_000)
+        except Exception:
+            pass
+        prices = [p for _, body in payloads for p in find_prices(body)]
+        text_price = best_price_text(await page.inner_text("body"))
+        if not prices and not text_price:
+            # Fiyatlar bazen sadece "Bilet Al" sonrası açılan adımda yükleniyor.
+            for name in BUY_BUTTONS:
+                btn = page.get_by_role("button", name=name)
+                if not await btn.count():
+                    btn = page.get_by_role("link", name=name)
+                if await btn.count():
+                    try:
+                        await btn.first.click(timeout=3000)
+                        await page.wait_for_load_state("networkidle", timeout=10_000)
+                    except Exception:
+                        pass
+                    break
+            prices = [p for _, body in payloads for p in find_prices(body)]
+            text_price = best_price_text(await page.inner_text("body"))
+        if sample:
+            for i, (url, body) in enumerate(payloads[:15]):
+                _save_sample(f"sayfa-{e.kaynak_id}-{i:02d}", url, body)
+        if prices:
+            return f"{min(prices):g}"
+        return text_price
+    except Exception as exc:
+        log.debug("Passo sayfa %s: %s", e.link, exc)
         return ""
+    finally:
+        await page.close()
 
 
-def _fill_prices(page, events: list[RawEvent]) -> None:
+async def _fill_from_event_pages(events: list[RawEvent], headless: bool) -> None:
+    from playwright.async_api import async_playwright
+
+    sem = asyncio.Semaphore(PAGE_CONCURRENCY)
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=headless, executable_path=os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE") or None)
+        context = await browser.new_context(user_agent=USER_AGENT, locale="tr-TR", timezone_id="Europe/Istanbul")
+        # Görsel/font indirmek fiyatı etkilemiyor, sadece yavaşlatıyor.
+        await context.route(re.compile(r"\.(png|jpe?g|webp|avif|gif|svg|woff2?|ttf)(\?|$)"), lambda r: r.abort())
+
+        async def one(i, e):
+            async with sem:
+                e.fiyat_ham = await _event_page_price(context, e, sample=i < DEBUG_SAMPLES)
+
+        await asyncio.gather(*(one(i, e) for i, e in enumerate(events)))
+        await browser.close()
+
+
+def _fill_prices_detail(page, events: list[RawEvent]) -> None:
+    samples = {"n": 0}
+
+    def get_json(url):
+        try:
+            r = page.request.get(url, headers=API_HEADERS, timeout=20_000)
+            body = r.json() if r.ok else None
+        except Exception:
+            return None
+        if samples["n"] < DEBUG_SAMPLES:
+            samples["n"] += 1
+            _save_sample(f"detay-{samples['n']}", url, body)
+        return body
+
     todo = [e for e in events if not e.fiyat_ham]
-    for e, p in zip(todo, map_concurrent(detail_price, todo)):
-        e.fiyat_ham = p
+    for e in todo:
+        e.fiyat_ham = detail_price(e, get_json)
     log.info("Passo detay API: %d/%d fiyat bulundu", sum(1 for e in todo if e.fiyat_ham), len(todo))
 
+
+def run_async(coro):
+    """Ayrı bir thread'de çalıştırır: sync Playwright'ın event loop'u açıkken de güvenli."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(asyncio.run, coro).result()
+
+
+def _fill_prices_pages(events: list[RawEvent], headless: bool) -> None:
     todo = [e for e in events if not e.fiyat_ham and e.link][:MAX_RENDERED_PRICE_PAGES]
-    for e in todo:
-        try:
-            page.goto(e.link, wait_until="domcontentloaded", timeout=30_000)
-            page.wait_for_selector("text=/\\d[\\d.]*(,\\d{2})?\\s*(₺|TL)/", state="attached", timeout=15_000)
-            e.fiyat_ham = best_price_text(page.inner_text("body"))
-        except Exception:
-            continue
     if todo:
-        log.info("Passo DOM yedeği: %d/%d sayfada fiyat bulundu", sum(1 for e in todo if e.fiyat_ham), len(todo))
+        run_async(_fill_from_event_pages(todo, headless))
+        log.info("Passo etkinlik sayfaları: %d/%d fiyat bulundu", sum(1 for e in todo if e.fiyat_ham), len(todo))
+    log.info("Passo: %d etkinliğin %d tanesi fiyatsız kaldı", len(events), sum(1 for e in events if not e.fiyat_ham))
 
 
 def scrape(headless: bool = True) -> list[RawEvent]:
     api_objs: dict[str, dict] = {}
+    list_samples: list[tuple[str, object]] = []
 
     def on_response(resp):
         if API_HOST not in resp.url or "json" not in resp.headers.get("content-type", ""):
             return
         try:
-            for o in find_events(resp.json()):
+            body = resp.json()
+            found = find_events(body)
+            if found and len(list_samples) < DEBUG_SAMPLES:
+                list_samples.append((resp.url, body))
+            for o in found:
                 key = _pick(o, ID_KEYS) or (_pick(o, NAME_KEYS) + _pick(o, DATE_KEYS))
                 api_objs[key] = o
         except Exception:
@@ -228,6 +356,9 @@ def scrape(headless: bool = True) -> list[RawEvent]:
         click_load_more(page, texts=("Daha Fazla Göster", "Daha Fazla", "Daha fazla"))
         scroll_to_bottom(page)
         page.wait_for_timeout(2000)
+        page.remove_listener("response", on_response)
+        for i, (url, body) in enumerate(list_samples):
+            _save_sample(f"liste-{i + 1}", url, body)
 
         if api_objs:
             events = [api_obj_to_event(o) for o in api_objs.values()]
@@ -236,8 +367,8 @@ def scrape(headless: bool = True) -> list[RawEvent]:
             cards = page.evaluate(DOM_JS)
             events = [e for c in cards if (e := dom_card_to_event(c))]
             source = "DOM"
-        page.remove_listener("response", on_response)
         log.info("Passo (%s): %d etkinlik, %d tanesinde listede fiyat var", source, len(events),
                  sum(1 for e in events if e.fiyat_ham))
-        _fill_prices(page, events)
+        _fill_prices_detail(page, events)
+    _fill_prices_pages(events, headless)
     return events

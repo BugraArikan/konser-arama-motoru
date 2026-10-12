@@ -4,9 +4,13 @@ Kart sınıf isimleri sık değiştiği için CSS class'ına bağlanmıyoruz. He
 `/etkinlik/` linkinden yukarı çıkıp tek bir etkinliği kapsayan en büyük kutuyu
 kart sayıyor, metin satırlarından tarih ve fiyatı ayıklıyoruz.
 
-Sayfa açılmazsa (ör. Actions'taki "Timeout 20000ms exceeded") aynı sayfanın
-sunucu HTML'ini doğrudan indirip JS kapalı bir sekmede ayrıştırıyoruz. Kartta fiyat
-yoksa etkinliğin kendi sayfasından tamamlanıyor.
+Sayfa açılmazsa aynı sayfanın sunucu HTML'ini doğrudan indirip JS kapalı bir
+sekmede ayrıştırıyoruz. Kartta fiyat yoksa etkinliğin kendi sayfasından tamamlanıyor.
+
+Bubilet, GitHub Actions gibi sunucu IP'lerinden gelen otomatik trafiğe Cloudflare
+doğrulaması gösteriyor. Bu doğrulamayı aşmaya çalışmıyoruz: sayfa doğrulama olarak
+gelirse bunu açıkça loglayıp Bubilet'i o gün için atlıyoruz, diğer kaynaklar çalışmaya
+devam ediyor. Zaman aşımı beklemesi de yaşanmıyor.
 """
 from __future__ import annotations
 
@@ -15,7 +19,7 @@ import re
 from urllib.parse import urljoin
 
 from .common import (
-    PRICE_TEXT_RE, RawEvent, accept_cookies, best_price_text, browser_page, click_load_more,
+    PRICE_TEXT_RE, BotChallenge, RawEvent, is_bot_challenge, accept_cookies, best_price_text, browser_page, click_load_more,
     dump_debug, fill_prices_from_pages, http_get, scroll_to_bottom,
 )
 
@@ -113,6 +117,8 @@ def card_to_event(card: dict, city: str) -> RawEvent | None:
 
 def _cards_rendered(page, url: str) -> list[dict]:
     page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+    if is_bot_challenge(page.title()) or is_bot_challenge(page.content()):
+        raise BotChallenge(url)
     accept_cookies(page)
     # state="attached": ilk eşleşen link gizli bir menüde olsa bile beklemeyi bitirir.
     # Varsayılan "visible" beklemesi Actions'taki zaman aşımının sebebiydi.
@@ -126,6 +132,8 @@ def _cards_from_html(page, url: str) -> list[dict]:
     html = http_get(url)
     if not html:
         return []
+    if is_bot_challenge(html):
+        raise BotChallenge(url)
     ctx = page.context.browser.new_context(java_script_enabled=False)
     try:
         p = ctx.new_page()
@@ -142,12 +150,20 @@ def scrape(headless: bool = True, cities: dict[str, str] | None = None) -> list[
             url = f"{BASE}/{slug}/etiket/konser"
             cards: list[dict] = []
             try:
-                cards = _cards_rendered(page, url)
-            except Exception as exc:
-                log.warning("Bubilet %s tarayıcıda açılamadı (%s), HTML'den deneniyor", url, exc)
-                dump_debug(page, f"bubilet-{slug}")
-            if not cards:
-                cards = _cards_from_html(page, url)
+                try:
+                    cards = _cards_rendered(page, url)
+                except BotChallenge:
+                    raise
+                except Exception as exc:
+                    log.warning("Bubilet %s tarayıcıda açılamadı (%s), HTML'den deneniyor", url, exc)
+                    dump_debug(page, f"bubilet-{slug}")
+                if not cards:
+                    cards = _cards_from_html(page, url)
+            except BotChallenge:
+                dump_debug(page, f"bubilet-{slug}-dogrulama")
+                log.error("Bubilet bu IP'den gelen otomatik erişimi Cloudflare doğrulamasıyla durdurdu; "
+                          "Bubilet bugün atlanıyor (%d etkinlik toplanmıştı).", len(events))
+                break
             city_events = [e for c in cards if (e := card_to_event(c, city))]
             log.info("Bubilet %s: %d etkinlik, %d tanesinde fiyat var", city, len(city_events),
                      sum(1 for e in city_events if e.fiyat_ham))
