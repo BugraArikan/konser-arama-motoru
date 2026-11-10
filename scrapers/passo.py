@@ -338,7 +338,7 @@ def scrape(headless: bool = True) -> list[RawEvent]:
             found = find_events(body)
             if found and len(list_samples) < DEBUG_SAMPLES:
                 list_samples.append((resp.url, body))
-            for o in found:
+            for o in found: 
                 key = _pick(o, ID_KEYS) or (_pick(o, NAME_KEYS) + _pick(o, DATE_KEYS))
                 api_objs[key] = o
         except Exception:
