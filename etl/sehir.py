@@ -130,6 +130,7 @@ VENUE_CITY = {
     "four seasons bosphorus": "İstanbul",
     "hunger torun": "İstanbul",
     "torun center": "İstanbul",
+    "milena pub": "Ankara",
     "congresium": "Ankara",
     "ankara arena": "Ankara",
     "cso ada": "Ankara",
@@ -155,8 +156,8 @@ def _word_re(keys) -> re.Pattern:
 
 _CITY_RE = _word_re(_CITY)
 _DISTRICT_RE = _word_re(_DISTRICT)
-# Ayraçlar: | ¦ │ / , ve boşluklu tire türleri ("Zorlu PSM - ... - İstanbul").
-_SPLIT_RE = re.compile(r"\s*[|¦│/,]\s*|\s+[-–—]\s+|\s*[–—]\s*")
+# Ayraçlar: | ¦ │ / , : ve boşluklu tire türleri ("Zorlu PSM - ... - İstanbul").
+_SPLIT_RE = re.compile(r"\s*[|¦│/,:]\s*|\s+[-–—]\s+|\s*[–—]\s*")
 
 
 def _segments_last_first(text: str) -> list[str]:
