@@ -46,8 +46,11 @@ jobs:
 
           use_main_mirror() {
             echo "::warning::Azure Ubuntu aynasına ulaşılamadı, archive.ubuntu.com kullanılıyor"
-            sudo sed -i 's#http://azure.archive.ubuntu.com#http://archive.ubuntu.com#g' \
-              /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
+            # Ubuntu 24.04 runner'larında depo adresi ubuntu.sources içindeki
+            # "mirror+file:/etc/apt/apt-mirrors.txt" listesinden okunuyor; üçü de güncelleniyor.
+            sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' /etc/apt/apt-mirrors.txt 2>/dev/null || true
+            sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+            sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' /etc/apt/sources.list 2>/dev/null || true
           }
 
           retry() {
