@@ -21,10 +21,52 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Bağımlılıklar
+      - name: Python bağımlılıkları
+        run: pip install --retries 5 --timeout 60 -r requirements.txt
+
+      # Tarayıcı dosyaları her gün yeniden indirilmesin; anahtar Playwright sürümüne bağlı.
+      - name: Playwright sürümü
+        id: pw
+        run: echo "version=$(python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      # Ubuntu ayna sunucusu (azure.archive.ubuntu.com) zaman zaman DNS hatası veriyor.
+      # apt'nin kendi tekrar denemesi açılıyor, her komut beklemeli olarak 5 kez deneniyor,
+      # 3. denemeden sonra ana Ubuntu arşivine geçiliyor.
+      - name: Sistem bağımlılıkları (tekrar denemeli)
+        timeout-minutes: 20
         run: |
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+          set -u
+          echo 'Acquire::Retries "5"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' \
+            | sudo tee /etc/apt/apt.conf.d/80-retries > /dev/null
+
+          use_main_mirror() {
+            echo "::warning::Azure Ubuntu aynasına ulaşılamadı, archive.ubuntu.com kullanılıyor"
+            sudo sed -i 's#http://azure.archive.ubuntu.com#http://archive.ubuntu.com#g' \
+              /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          }
+
+          retry() {
+            local n=1 max=5 delay=15
+            until "$@"; do
+              if [ "$n" -ge "$max" ]; then
+                echo "::error::$n denemede başarısız: $*"
+                return 1
+              fi
+              [ "$n" -eq 3 ] && use_main_mirror
+              echo "::warning::Deneme $n başarısız, $((delay * n)) sn sonra tekrar: $*"
+              sleep $((delay * n))
+              n=$((n + 1))
+            done
+          }
+
+          retry sudo apt-get update --error-on=any
+          retry sudo -E env "PATH=$PATH" python -m playwright install-deps chromium
+          retry python -m playwright install chromium
 
       - name: Testler
         run: pytest -q
