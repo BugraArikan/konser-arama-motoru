@@ -8,12 +8,15 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import unicodedata
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from etl.sehir import infer_city
 
 TZ = ZoneInfo("Europe/Istanbul")
 
@@ -149,7 +152,12 @@ def clean(raw: pd.DataFrame, today: date | None = None) -> tuple[pd.DataFrame, p
     parsed = df["tarih_ham"].map(lambda s: parse_date(s, today))
     df["tarih"] = parsed.map(lambda x: x[0])
     df["saat"] = parsed.map(lambda x: x[1])
-    df["sehir"] = df["sehir"].map(lambda s: s.title() if s else s)
+    # Boş şehirleri mekan/başlık metninden doldur (bkz. etl/sehir.py). Gruplamadan önce
+    # yapılıyor ki şehri sonradan bulunan ilanlar da doğru konsere bağlansın.
+    inferred = [infer_city(s, m, b) for s, m, b in zip(df["sehir"], df["mekan"], df["baslik"])]
+    df["sehir"] = [c for c, _ in inferred]
+    df["sehir_kaynagi"] = [k for _, k in inferred]
+    logging.getLogger("clean").info("Şehir kaynağı: %s", df["sehir_kaynagi"].replace("", "bulunamadi").value_counts().to_dict())
     df["sanatci_norm"] = df["baslik"].map(normalize_title)
     df["sehir_norm"] = df["sehir"].map(fold)
 
@@ -209,7 +217,7 @@ def main() -> None:
     konserler, ilanlar = clean(pd.read_csv(a.inp, dtype=str))
     konserler.to_csv(a.outdir / "konserler.csv", index=False)
     ilanlar.to_csv(a.outdir / "ilanlar.csv", index=False)
-    print(f"{len(ilanlar)} ilan, {len(konserler)} konser "
+    print(f"{len(ilanlar)} ilan, {len(konserler)} konser, şehri boş ilan: {(ilanlar['sehir'] == '').sum()} "
           f"({(konserler['kaynak_sayisi'] > 1).sum()} tanesi birden fazla sitede)")
 
 
